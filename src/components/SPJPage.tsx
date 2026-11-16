@@ -1,0 +1,614 @@
+// SPJ-01, SPJ-02, SPJ-03, SPJ-04, BNT-04 — Halaman SPJ untuk PPTK (D02 §5, D01 §9, D03 §10)
+import { useReducer, useState } from 'react';
+import {
+  Button, Card, StatusBadge, Field, Select, Modal,
+  useToast, SearchBox, FilterSelect, EmptyState,
+} from '@/components/ui';
+import { repo } from '@/data/repo';
+import { gerbangStatus } from '@/data/anggaran';
+import { formatRupiah } from '@/lib/format';
+import { formatTanggalPendek } from '@/lib/wita';
+import { getSession } from '@/lib/auth';
+import { ErrorLine, Panel, SectionTitle } from '@/components/AnggaranShared';
+import { CetakVerifikasiModal } from '@/components/CetakVerifikasi';
+import { PajakSPJPanel, barisPajakDariSPJ, type BarisPajak } from '@/components/PajakSPJModal';
+import { UnggahBerkas } from '@/components/UnggahBerkas';
+import { simpanBerkasSesi, hapusBerkasSesi, formatUkuran } from '@/lib/berkas';
+import { bisaBukaLampiran, bukaLampiranSPJ } from '@/lib/lampiran';
+import { modeServer } from '@/lib/supabase';
+import { RekeningPenerimaPanel, barisDariSPJ, type BarisRekening } from '@/components/RekeningPenerimaPanel';
+import { IsianField } from '@/components/IsianField';
+import type { SPJ, Kuitansi, SessionPayload, FormDinamis, FieldFormDinamis } from '@/data/types';
+import { ScrollText, Plus, Trash2, Send, Clock as Unlock, Lock, Eye, Pencil, Printer, Circle as XCircle } from 'lucide-react';
+
+export function SPJPage() {
+  const sesi = getSession();
+  const [, bump] = useReducer((x: number) => x + 1, 0);
+  if (!sesi || !sesi.active_ta_id || !sesi.active_seksi_id || sesi.active_role !== 'pptk') return null;
+  const ta_id = sesi.active_ta_id;
+  const seksi_id = sesi.active_seksi_id;
+  const seksi = repo.seksiTAById(seksi_id);
+  if (!seksi) return null;
+
+  return <SPJContent sesi={sesi} ta_id={ta_id} seksi_id={seksi_id} seksiNama={seksi.nama_snapshot} onChanged={() => bump()} />;
+}
+
+function SPJContent({ sesi, ta_id, seksi_id, seksiNama, onChanged }: {
+  sesi: SessionPayload; ta_id: string; seksi_id: string; seksiNama: string; onChanged: () => void;
+}) {
+  const { notify } = useToast();
+  const [showCreate, setShowCreate] = useState(false);
+  const [editSPJ, setEditSPJ] = useState<SPJ | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  // R-145: filter
+  const [filterStatus, setFilterStatus] = useState('');
+  const [filterJenis, setFilterJenis] = useState('');
+  const [search, setSearch] = useState('');
+
+  const ta = repo.tahunAnggaranById(ta_id)!;
+  const kuitansiSeksi = repo.kuitansiBySeksi(seksi_id).filter((k) => k.ta_id === ta_id);
+  const spjSeksi = repo.spjByTA(ta_id).filter((s) => kuitansiSeksi.some((k) => k.id === s.kuitansi_id));
+
+  const filtered = spjSeksi.filter((s) => {
+    if (filterStatus && s.status !== filterStatus) return false;
+    if (filterJenis && s.jenis_belanja !== filterJenis) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      const k = kuitansiSeksi.find((x) => x.id === s.kuitansi_id);
+      if (!k?.uraian.toLowerCase().includes(q) && !s.jenis_belanja.toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
+  // Kuitansi Aktif yang belum punya SPJ (bisa dibuatkan SPJ)
+  const kuitansiUntukSPJ = kuitansiSeksi.filter((k) => k.status === 'Aktif' && !repo.spjByKuitansi(k.id) && repo.canCreateSPJ(ta_id));
+
+  const jenisBelanjaList = repo.jenisBelanjaList();
+
+  return (
+    <div className="space-y-4">
+      <Panel>
+        <SectionTitle title="SPJ Seksi" desc={`${seksiNama} • TA ${ta.tahun}`} />
+        <div className="flex flex-wrap items-center gap-4 text-sm text-mist">
+          <span>Total: <span className="mono tnum">{filtered.length}</span></span>
+          <span>Kuitansi Aktif tanpa SPJ: <span className="mono tnum">{kuitansiUntukSPJ.length}</span></span>
+        </div>
+        <div className="mt-4">
+          <Button variant="primary" disabled={kuitansiUntukSPJ.length === 0 || !repo.canCreateSPJ(ta_id) || !gerbangStatus(ta_id).terbuka} onClick={() => { setShowCreate(true); setErr(null); }}>
+            <Plus size={16} /> Buat SPJ
+          </Button>
+          {kuitansiUntukSPJ.length === 0 && <span className="ml-3 text-2xs text-mist-dim">Tidak ada kuitansi Aktif yang siap dipasangkan SPJ.</span>}
+          {ta.status === 'Masa Transisi' && <span className="ml-3 text-2xs text-warn">TA Masa Transisi: tidak dapat membuat SPJ baru.</span>}
+        </div>
+      </Panel>
+
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-ink-edge px-4 py-3">
+          <h3 className="text-sm font-semibold text-mist">Daftar SPJ</h3>
+          <div className="flex flex-wrap items-center gap-2">
+            <SearchBox value={search} onChange={setSearch} placeholder="Cari uraian/jenis..." />
+            <FilterSelect value={filterStatus} onChange={setFilterStatus} label="Status" options={[
+              { value: 'Draft', label: 'Draft' }, { value: 'Terkunci', label: 'Terkunci' },
+              { value: 'Menunggu BKU', label: 'Menunggu BKU' }, { value: 'Dibukukan', label: 'Dibukukan' },
+            ]} />
+            <FilterSelect value={filterJenis} onChange={setFilterJenis} label="Jenis Belanja"
+              options={jenisBelanjaList.map((j) => ({ value: j, label: j }))} />
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          {filtered.length === 0 ? (
+            <EmptyState icon={<ScrollText size={28} />} title="Belum ada SPJ" />
+          ) : (
+            <table className="w-full text-2xs">
+              <thead className="bg-ink text-mist-dim">
+                <tr className="text-left">
+                  <th className="px-4 py-2 font-medium whitespace-nowrap">Kuitansi</th>
+                  <th className="px-4 py-2 font-medium whitespace-nowrap">Jenis Belanja</th>
+                  <th className="px-4 py-2 font-medium whitespace-nowrap">Versi Form</th>
+                  <th className="px-4 py-2 font-medium whitespace-nowrap">Status</th>
+                  <th className="px-4 py-2 font-medium whitespace-nowrap">Aksi</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((s, i) => {
+                  const k = kuitansiSeksi.find((x) => x.id === s.kuitansi_id);
+                  return (
+                    <tr key={s.id} className={i % 2 ? 'bg-ink-surface/40' : ''}>
+                      <td className="px-4 py-2 text-mist">
+                        <div>{k?.uraian ?? '—'}</div>
+                        <div className="text-mist-dim">{k && formatTanggalPendek(k.tanggal_kuitansi)} • {formatRupiah(k?.bruto ?? 0)}</div>
+                      </td>
+                      <td className="px-4 py-2 text-mist-dim">{s.jenis_belanja}</td>
+                      <td className="px-4 py-2 text-mist-dim mono">{s.versi_form}</td>
+                      <td className="px-4 py-2">
+                        <SPJStatusBadge status={s.status} />
+                        {s.catatan_revisi && <div className="mt-1 text-2xs text-warn">Revisi: {s.catatan_revisi}</div>}
+                      </td>
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-1">
+                          <button onClick={() => setEditSPJ(s)} className="rounded p-1 text-mist-dim hover:text-amber" title="Buka SPJ">
+                            <Eye size={14} />
+                          </button>
+                          {s.status === 'Draft' && (
+                            <>
+                              <button onClick={async () => {
+                                const r = await repo.lepasSPJ(s.id, sesi);
+                                if (!r.ok) { setErr(r.error ?? 'Gagal'); return; }
+                                notify('Tersimpan'); onChanged();
+                              }} className="rounded p-1 text-mist-dim hover:text-teal" title="Lepas SPJ (kuitansi kembali Aktif)">
+                                <Unlock size={14} />
+                              </button>
+                              <button onClick={async () => {
+                                if (confirm('Batalkan SPJ ini? Data akan dihapus tanpa jejak.')) {
+                                  const r = await repo.batalkanSPJ(s.id, sesi);
+                                  if (!r.ok) { setErr(r.error ?? 'Gagal'); return; }
+                                  notify('Tersimpan'); onChanged();
+                                }
+                              }} className="rounded p-1 text-mist-dim hover:text-crit" title="Batalkan SPJ">
+                                <XCircle size={14} />
+                              </button>
+                            </>
+                          )}
+                          {s.status === 'Terkunci' && <Lock size={14} className="text-mist-dim" />}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </Card>
+      <ErrorLine msg={err} />
+
+      {showCreate && (
+        <BuatSPJModal sesi={sesi} ta_id={ta_id} kuitansiOptions={kuitansiUntukSPJ} jenisBelanjaList={jenisBelanjaList}
+          onClose={() => setShowCreate(false)}
+          onCreated={() => { setShowCreate(false); notify('Tersimpan'); onChanged(); }} />
+      )}
+
+      {editSPJ && (
+        <EditSPJModal sesi={sesi} spj={editSPJ} kuitansi={kuitansiSeksi.find((k) => k.id === editSPJ.kuitansi_id) ?? null}
+          onClose={() => { setEditSPJ(null); onChanged(); }}
+          onSaved={() => { notify('Tersimpan'); onChanged(); }} />
+      )}
+    </div>
+  );
+}
+
+// Teks status lampiran: proses unggah, ukuran sebelum/sesudah optimasi (D01 §13 poin 6).
+function statusLampiran(spj: SPJ, proses: string | null): string | null {
+  if (proses && proses !== 'Berhasil') return proses;
+  if (!spj.lampiran_nama_asli || spj.lampiran_ukuran_asal === null) return null;
+  const asal = formatUkuran(spj.lampiran_ukuran_asal);
+  if (spj.lampiran_status_optimasi === 'BYPASSED') return `Berhasil. Ukuran ${asal}, dikirim langsung tanpa kompresi (sampai 5 MB).`;
+  if (spj.lampiran_status_optimasi === 'FAILED' || spj.lampiran_status_optimasi === 'SERVER_FALLBACK_COMPRESSED') return `Berhasil disimpan. Ukuran ${asal} (di atas 5 MB): berkas disimpan apa adanya, tanpa kompresi.`;
+  return `Ukuran ${asal}${spj.lampiran_ukuran_final !== null ? `, setelah optimasi ${formatUkuran(spj.lampiran_ukuran_final)}` : ''}.`;
+}
+
+function SPJStatusBadge({ status }: { status: SPJ['status'] }) {
+  const kind = status === 'Draft' ? 'neutral' : status === 'Terkunci' ? 'warn' : status === 'Menunggu BKU' ? 'spike' : 'ok';
+  return <StatusBadge kind={kind as 'neutral' | 'warn' | 'spike' | 'ok'} label={status} />;
+}
+
+// ===== SPJ-01 — Buat SPJ: pilih kuitansi Aktif + jenis belanja =====
+function BuatSPJModal({ sesi, ta_id, kuitansiOptions, jenisBelanjaList, onClose, onCreated }: {
+  sesi: SessionPayload; ta_id: string;
+  kuitansiOptions: Kuitansi[];
+  jenisBelanjaList: string[];
+  onClose: () => void; onCreated: () => void;
+}) {
+  const [kuitansiId, setKuitansiId] = useState('');
+  const [jenis, setJenis] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+
+  const simpan = async () => {
+    setErr(null);
+    if (!kuitansiId) { setErr('Pilih kuitansi.'); return; }
+    if (!jenis) { setErr('Pilih jenis belanja.'); return; }
+    const r = await repo.buatSPJ({ ta_id, kuitansi_id: kuitansiId, jenis_belanja: jenis }, sesi);
+    if (!r.ok) { setErr(r.error ?? 'Gagal'); return; }
+    onCreated();
+  };
+
+  return (
+    <Modal open={true} onClose={onClose} title="Buat SPJ" wide
+      footer={<div className="flex items-center justify-between"><ErrorLine msg={err} /><div className="flex gap-2"><Button variant="ghost" onClick={onClose}>Batal</Button><Button variant="primary" onClick={simpan}>Buat SPJ</Button></div></div>}>
+      <div className="space-y-4">
+        <Field label="Kuitansi Aktif (tanpa SPJ)" required>
+          <Select value={kuitansiId} onChange={(e) => setKuitansiId(e.target.value)}>
+            <option value="">Pilih kuitansi</option>
+            {kuitansiOptions.map((k) => (
+              <option key={k.id} value={k.id}>{formatTanggalPendek(k.tanggal_kuitansi)} — {k.uraian} ({formatRupiah(k.bruto)})</option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Jenis Belanja" required hint="Menentukan Form Dinamis yang tampil. Tidak dapat diubah setelah SPJ dibuat.">
+          <Select value={jenis} onChange={(e) => setJenis(e.target.value)}>
+            <option value="">Pilih jenis belanja</option>
+            {jenisBelanjaList.map((j) => <option key={j} value={j}>{j}</option>)}
+          </Select>
+        </Field>
+        <p className="text-2xs text-mist-dim">SPJ berpasangan 1:1 dengan kuitansi. Kuitansi akan terkunci sejak SPJ Draft dibuat.</p>
+      </div>
+    </Modal>
+  );
+}
+
+// ===== SPJ-04 + BNT-04 — Pop-up berlangkah: Isian Form → Rekening Penerima → Pajak → Lampiran & Ajukan =====
+// Data tersimpan di setiap langkah (draft). SPJ baru dapat diajukan ke Verifikator bila semua data lengkap.
+const NAMA_LANGKAH = ['Isian Form', 'Rekening Penerima', 'Pajak', 'Lampiran & Ajukan'] as const;
+
+function EditSPJModal({ sesi, spj: spjAwal, kuitansi, onClose, onSaved }: {
+  sesi: SessionPayload; spj: SPJ; kuitansi: Kuitansi | null;
+  onClose: () => void; onSaved: () => void;
+}) {
+  const { notify } = useToast();
+  // Data hasil muat ulang dari server menggantikan objek lama; ambil versi terbaru pada tiap render.
+  const spj = repo.spjById(spjAwal.id) ?? spjAwal;
+  const [err, setErr] = useState<string | null>(null);
+  const [langkah, setLangkah] = useState(0);
+  const [sibuk, setSibuk] = useState(false);
+  const [cetakVer, setCetakVer] = useState(false);
+  const [rekBaris, setRekBaris] = useState<BarisRekening[]>(() => barisDariSPJ(spj));
+  const [pajakBaris, setPajakBaris] = useState<BarisPajak[]>(() => barisPajakDariSPJ(spj));
+  const [unggahStatus, setUnggahStatus] = useState<string | null>(null);
+
+  // SPJ-06: urutan status UI "Menyiapkan dokumen..." lalu "Mengunggah dokumen..."; sukses setelah lapisan data menerima.
+  // Kompresi PDF belum ada: berkas di atas 5 MB disimpan apa adanya dan dicatat berstatus FAILED.
+  const pilihLampiran = async (f: File) => {
+    setErr(null);
+    setUnggahStatus(modeServer ? 'Mengunggah dokumen...' : null);
+    const cek = await repo.simpanLampiranSPJ(spj.id, { nama: f.name, ukuran: f.size, file: f }, sesi);
+    if (!cek.ok) { setUnggahStatus(null); setErr(cek.error ?? 'Gagal'); return; }
+    if (modeServer) { setUnggahStatus('Berhasil'); notify('Tersimpan'); onSaved(); return; }
+    setUnggahStatus('Menyiapkan dokumen...');
+    window.setTimeout(() => {
+      setUnggahStatus('Mengunggah dokumen...');
+      window.setTimeout(() => {
+        simpanBerkasSesi(spj.id, f);
+        setUnggahStatus('Berhasil');
+        notify('Tersimpan');
+        onSaved();
+      }, 400);
+    }, 400);
+  };
+  const hapusLampiran = async () => {
+    setErr(null);
+    const r = await repo.hapusLampiranSPJ(spj.id, sesi);
+    if (!r.ok) { setErr(r.error ?? 'Gagal'); return; }
+    hapusBerkasSesi(spj.id);
+    setUnggahStatus(null);
+    notify('Tersimpan');
+    onSaved();
+  };
+  const isDraft = spj.status === 'Draft';
+  const form = repo.getFormByVersion(spj.jenis_belanja, spj.versi_form);
+
+  // State jawaban: field tunggal + blok berulang
+  const [jawaban, setJawaban] = useState<Record<string, string | string[] | Record<string, string>[]>>(() => {
+    const init: Record<string, string | string[] | Record<string, string>[]> = {};
+    if (form) {
+      for (const f of form.fields) init[f.id] = spj.jawaban[f.id] ?? '';
+      if (form.blok_berulang) {
+        const existing = spj.jawaban[form.blok_berulang.id];
+        init[form.blok_berulang.id] = Array.isArray(existing) ? existing : [createBlokRow(form.blok_berulang.id, form.blok_berulang.fields)];
+      }
+    }
+    return init;
+  });
+
+  // Kelengkapan: dasar tombol Ajukan. Pajak opsional ("SPJ tanpa pajak tetap dapat diterima").
+  const rekLengkap = rekBaris.length > 0 && rekBaris.every((r) => r.account_name.trim() && r.bank_name.trim() && r.account_number.trim());
+  const errWajib = form ? repo.cekWajibSPJ(form, jawaban) : null;
+  const ada = {
+    form: !errWajib,
+    rekening: rekLengkap,
+    lampiran: !!spj.lampiran_nama_asli,
+  };
+  const lengkap = ada.form && ada.rekening && ada.lampiran;
+
+  /** Simpan data satu langkah sebagai draft. Mengembalikan false (dan menampilkan galat) bila ditolak. */
+  const simpanLangkah = async (n: number): Promise<boolean> => {
+    if (!isDraft) return true;
+    setErr(null);
+    if (n === 0 && form) {
+      // BNT-04: catat direktori dari field bertag [SYS_PERSONNEL_ID] / [SYS_PERSONNEL_NAME]
+      _catatDirektoriFromJawaban(form, jawaban, spj.id);
+      const r = await repo.simpanJawabanSPJ(spj.id, jawaban, sesi);
+      if (!r.ok) { setLangkah(0); setErr(r.error ?? 'Gagal'); return false; }
+    }
+    if (n === 1) {
+      // REK-02: rincian penerima (auto-capture ke Direktori Rekening Bank)
+      const r = await repo.simpanRekeningSPJ(spj.id, rekBaris, sesi);
+      if (!r.ok) { setLangkah(1); setErr(r.error ?? 'Gagal'); return false; }
+    }
+    if (n === 2) {
+      if (pajakBaris.some((x) => !x.jenis_pajak_id)) { setLangkah(2); setErr('Pilih jenis pajak pada setiap entri.'); return false; }
+      const r = await repo.simpanEntriPajakSPJ(spj.id, pajakBaris.map((x) => ({ jenis_pajak_id: x.jenis_pajak_id, nominal: x.nominal })), sesi);
+      if (!r.ok) { setLangkah(2); setErr(r.error ?? 'Gagal'); return false; }
+    }
+    return true;
+  };
+
+  const bungkus = async (fn: () => Promise<void>) => {
+    if (sibuk) return;
+    setSibuk(true);
+    try { await fn(); } finally { setSibuk(false); }
+  };
+
+  const lanjut = () => bungkus(async () => {
+    if (!(await simpanLangkah(langkah))) return;
+    onSaved();
+    setLangkah((l) => Math.min(l + 1, NAMA_LANGKAH.length - 1));
+  });
+  const kembali = () => { setErr(null); setLangkah((l) => Math.max(l - 1, 0)); };
+  const pindahKe = (n: number) => { if (n <= langkah) { setErr(null); setLangkah(n); } };
+
+  const simpanTutup = () => bungkus(async () => {
+    if (!(await simpanLangkah(langkah))) return;
+    notify('Tersimpan');
+    onClose();
+  });
+
+  const ajukan = () => bungkus(async () => {
+    setErr(null);
+    if (!lengkap) { setErr('Data belum lengkap. Lengkapi semua bagian yang bertanda ✗ sebelum diajukan.'); return; }
+    for (const n of [0, 1, 2]) if (!(await simpanLangkah(n))) return;
+    const r = await repo.ajukanSPJ(spj.id, sesi);
+    if (!r.ok) { setErr(r.error ?? 'Gagal'); return; }
+    notify('Tersimpan');
+    onClose();
+  });
+
+  const lepas = async () => {
+    if (!confirm('Lepas SPJ ini? Kuitansi akan kembali Aktif. Data SPJ dihapus tanpa jejak.')) return;
+    const r = await repo.lepasSPJ(spj.id, sesi);
+    if (!r.ok) { setErr(r.error ?? 'Gagal'); return; }
+    notify('Tersimpan');
+    onClose();
+  };
+
+  const terakhir = langkah === NAMA_LANGKAH.length - 1;
+  const centang = (ok: boolean, label: string, hint?: string) => (
+    <li key={label} className="flex items-start gap-2 text-2xs">
+      <span className={ok ? 'text-ok' : 'text-crit'}>{ok ? '✓' : '✗'}</span>
+      <span className={ok ? 'text-mist' : 'text-crit'}>{label}{!ok && hint ? ` — ${hint}` : ''}</span>
+    </li>
+  );
+
+  return (
+    <>
+    <Modal open={true} onClose={onClose} title={`SPJ — ${spj.jenis_belanja} (${spj.versi_form})`} wider
+      footer={
+        <div className="flex items-center justify-between gap-3">
+          <ErrorLine msg={err} />
+          <div className="ml-auto flex flex-wrap justify-end gap-2">
+            {isDraft && <Button variant="danger" onClick={lepas} disabled={sibuk}><Unlock size={14} /> Lepas SPJ</Button>}
+            {langkah > 0 && <Button variant="ghost" onClick={kembali} disabled={sibuk}>Kembali</Button>}
+            {isDraft && <Button variant="secondary" onClick={simpanTutup} disabled={sibuk}><Pencil size={14} /> Simpan &amp; Tutup</Button>}
+            {!terakhir && <Button variant="primary" onClick={lanjut} disabled={sibuk}>{isDraft ? 'Simpan & Lanjut' : 'Lanjut'}</Button>}
+            {terakhir && isDraft && <Button variant="primary" onClick={ajukan} disabled={sibuk || !lengkap}><Send size={14} /> Ajukan ke Verifikator</Button>}
+            {(spj.status === 'Menunggu BKU' || spj.status === 'Dibukukan') && (
+              <Button variant="secondary" onClick={() => setCetakVer(true)}><Printer size={14} /> Cetak Hasil Verifikasi</Button>
+            )}
+            {!isDraft && <span className="self-center text-2xs text-mist-dim">SPJ {spj.status} — tidak dapat diubah</span>}
+          </div>
+        </div>
+      }
+    >
+      {/* Info kuitansi */}
+      {kuitansi && (
+        <div className="mb-4 rounded-md border border-ink-edge bg-ink p-3 text-2xs text-mist-dim">
+          <div>Kuitansi: <span className="text-mist">{kuitansi.uraian}</span></div>
+          <div>Bruto: <span className="text-mist mono tnum">{formatRupiah(kuitansi.bruto)}</span> • Penerima: <span className="text-mist">{kuitansi.penerima}</span></div>
+          <div>Status SPJ: <SPJStatusBadge status={spj.status} /></div>
+          {spj.catatan_revisi && <div className="mt-1 text-warn">Catatan revisi: {spj.catatan_revisi}</div>}
+        </div>
+      )}
+
+      {/* Indikator langkah */}
+      <ol className="mb-4 grid grid-cols-4 gap-1" aria-label="Langkah SPJ">
+        {NAMA_LANGKAH.map((nm, i) => {
+          const aktif = i === langkah, selesai = i < langkah;
+          return (
+            <li key={nm}>
+              <button type="button" onClick={() => pindahKe(i)} disabled={i > langkah}
+                aria-current={aktif ? 'step' : undefined}
+                className={`w-full rounded-md border px-2 py-1.5 text-left text-2xs ${aktif ? 'border-amber text-amber' : selesai ? 'border-ink-edge text-mist hover:border-amber/40' : 'border-ink-edge text-mist-dim opacity-60'}`}>
+                <span className="mono mr-1">{i + 1}.</span>{nm}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+
+      {langkah === 0 && (form
+        ? <FormDinamisEditor form={form} jawaban={jawaban} setJawaban={setJawaban} isDraft={isDraft} />
+        : <p className="text-sm text-mist-dim">Form tidak ditemukan untuk versi {spj.versi_form}.</p>)}
+
+      {langkah === 1 && <RekeningPenerimaPanel sesi={sesi} spj={spj} isDraft={isDraft} baris={rekBaris} setBaris={setRekBaris} />}
+
+      {langkah === 2 && <PajakSPJPanel spj={spj} isDraft={isDraft} baris={pajakBaris} setBaris={setPajakBaris} />}
+
+      {langkah === 3 && (
+        <div className="space-y-4">
+          <div className="space-y-1.5 text-2xs text-mist-dim">
+            <div>Lampiran PDF <span className="text-crit">*</span></div>
+            <UnggahBerkas
+              nama={spj.lampiran_nama_asli} accept=".pdf,application/pdf" disabled={!isDraft}
+              label={spj.lampiran_nama_asli ? 'Ganti PDF' : 'Pilih PDF'}
+              status={statusLampiran(spj, unggahStatus)}
+              onPilih={pilihLampiran} onHapus={hapusLampiran}
+              onBuka={async () => { const r = await bukaLampiranSPJ(spj.id); if (!r.ok) setErr(r.error ?? 'Gagal'); }} bisaBuka={bisaBukaLampiran(spj.id, !!spj.lampiran_nama_asli)} />
+          </div>
+          <div className="rounded-md border border-ink-edge bg-ink p-3">
+            <p className="mb-2 text-2xs font-semibold text-mist">Kelengkapan data</p>
+            <ul className="space-y-1">
+              {centang(ada.form, 'Isian Form Dinamis', errWajib ?? undefined)}
+              {centang(ada.rekening, 'Rekening penerima (minimal satu, terisi lengkap)', 'langkah 2')}
+              {centang(ada.lampiran, 'Lampiran PDF', 'unggah di atas')}
+              <li className="flex items-start gap-2 text-2xs"><span className="text-mist-dim">•</span><span className="text-mist-dim">Pajak: {pajakBaris.length === 0 ? 'tanpa pajak' : `${pajakBaris.length} entri`} (opsional)</span></li>
+            </ul>
+            {isDraft && !lengkap && <p className="mt-2 text-2xs text-warn">SPJ belum dapat diajukan ke Verifikator sebelum semua bagian bertanda ✓.</p>}
+            {isDraft && lengkap && <p className="mt-2 text-2xs text-ok">Semua data lengkap. SPJ siap diajukan ke Verifikator.</p>}
+          </div>
+        </div>
+      )}
+    </Modal>
+    {cetakVer && <CetakVerifikasiModal spj_id={spj.id} onClose={() => setCetakVer(false)} />}
+    </>
+  );
+}
+
+// ===== SPJ-04 — Form Dinamis editor dengan blok berulang + BNT-04 auto-fill =====
+function FormDinamisEditor({ form, jawaban, setJawaban, isDraft }: {
+  form: FormDinamis;
+  jawaban: Record<string, string | string[] | Record<string, string>[]>;
+  setJawaban: (j: Record<string, string | string[] | Record<string, string>[]>) => void;
+  isDraft: boolean;
+}) {
+  const setField = (id: string, val: string) => {
+    setJawaban({ ...jawaban, [id]: val });
+  };
+
+  // BNT-04: auto-fill nama dari Direktori Transaksional
+  const handleNipNikChange = (fieldId: string, val: string, partnerFieldId: string) => {
+    const dir = repo.lookupDirektori(val);
+    const lama = repo.lookupDirektori(String(jawaban[fieldId] ?? ''));
+    if (dir) {
+      setJawaban({ ...jawaban, [fieldId]: val, [partnerFieldId]: dir.nama });
+    } else if (lama && jawaban[partnerFieldId] === lama.nama) {
+      setJawaban({ ...jawaban, [fieldId]: val, [partnerFieldId]: '' }); // nama terisi otomatis dari NIP/NIK lama dikosongkan
+    } else {
+      setField(fieldId, val);
+    }
+  };
+
+  // Blok berulang
+  const blok = form.blok_berulang;
+  const blokRows: Record<string, string>[] = blok ? (Array.isArray(jawaban[blok.id]) ? jawaban[blok.id] as Record<string, string>[] : [createBlokRow(blok.id, blok.fields)]) : [];
+
+  const setBlokRow = (idx: number, fieldId: string, val: string) => {
+    const newRows = [...blokRows];
+    newRows[idx] = { ...newRows[idx], [fieldId]: val };
+    setJawaban({ ...jawaban, [blok!.id]: newRows });
+  };
+
+  const handleBlokNipNik = (idx: number, fieldId: string, val: string, partnerFieldId: string) => {
+    const dir = repo.lookupDirektori(val);
+    const newRows = [...blokRows];
+    const lama = repo.lookupDirektori(newRows[idx][fieldId] ?? '');
+    const hapusNama = !dir && !!lama && newRows[idx][partnerFieldId] === lama.nama;
+    newRows[idx] = { ...newRows[idx], [fieldId]: val, ...(dir ? { [partnerFieldId]: dir.nama } : hapusNama ? { [partnerFieldId]: '' } : {}) };
+    setJawaban({ ...jawaban, [blok!.id]: newRows });
+  };
+
+  const tambahBlokEntri = () => {
+    if (!blok) return;
+    const newRows = [...blokRows, createBlokRow(blok.id, blok.fields)];
+    setJawaban({ ...jawaban, [blok.id]: newRows });
+  };
+
+  const hapusBlokEntri = (idx: number) => {
+    if (!blok || blokRows.length <= 1) return; // min 1 entri
+    const newRows = blokRows.filter((_, i) => i !== idx);
+    setJawaban({ ...jawaban, [blok.id]: newRows });
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Field tunggal */}
+      {form.fields.map((f) => (
+        <FieldDinamis key={f.id} field={f} value={jawaban[f.id] as string ?? ''} onChange={(v) => {
+          // Cek apakah field ini punya tag [SYS_PERSONNEL_ID]
+          if (f.system_tag === '[SYS_PERSONNEL_ID]') {
+            // Cari partner [SYS_PERSONNEL_NAME] di field utama
+            const partner = form.fields.find((x) => x.system_tag === '[SYS_PERSONNEL_NAME]');
+            if (partner) { handleNipNikChange(f.id, v, partner.id); return; }
+          }
+          setField(f.id, v);
+        }} disabled={!isDraft} />
+      ))}
+
+      {/* Blok berulang */}
+      {blok && (
+        <div className="border-t border-ink-edge pt-4">
+          <div className="mb-2 flex items-center justify-between">
+            <h4 className="text-sm font-semibold text-mist">{blok.nama}</h4>
+            {isDraft && <Button variant="secondary" onClick={tambahBlokEntri}><Plus size={14} /> Tambah</Button>}
+          </div>
+          <div className="space-y-3">
+            {blokRows.map((row, idx) => (
+              <div key={idx} className="rounded-md border border-ink-edge bg-ink p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-2xs text-mist-dim">Entri {idx + 1}</span>
+                  {isDraft && blokRows.length > 1 && (
+                    <button onClick={() => hapusBlokEntri(idx)} className="text-mist-dim hover:text-crit" title="Hapus entri">
+                      <Trash2 size={14} />
+                    </button>
+                  )}
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {blok.fields.map((bf) => (
+                    <FieldDinamis key={bf.id} field={bf} value={row[bf.id] ?? ''} onChange={(v) => {
+                      if (bf.system_tag === '[SYS_PERSONNEL_ID]') {
+                        const partner = blok.fields.find((x) => x.system_tag === '[SYS_PERSONNEL_NAME]');
+                        if (partner) { handleBlokNipNik(idx, bf.id, v, partner.id); return; }
+                      }
+                      setBlokRow(idx, bf.id, v);
+                    }} disabled={!isDraft} />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          {isDraft && <p className="mt-2 text-2xs text-mist-dim">Minimal satu entri. Field wajib harus diisi sebelum diajukan.</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Helper: buat row kosong untuk blok berulang
+function createBlokRow(blokId: string, fields: FieldFormDinamis[]): Record<string, string> {
+  const row: Record<string, string> = {};
+  for (const f of fields) row[f.id] = '';
+  return row;
+}
+
+// Render field tunggal Form Dinamis (semua tipe ada di IsianField)
+function FieldDinamis({ field, value, onChange, disabled }: {
+  field: FieldFormDinamis; value: string; onChange: (v: string) => void; disabled: boolean;
+}) {
+  return <IsianField f={field} value={value} onChange={onChange} disabled={disabled} />;
+}
+
+// BNT-04: Catat pasangan NIP/NIK + nama dari jawaban ke Direktori Transaksional
+function _catatDirektoriFromJawaban(form: FormDinamis, jawaban: Record<string, string | string[] | Record<string, string>[]>, spjId: string) {
+  // Field utama
+  const idField = form.fields.find((f) => f.system_tag === '[SYS_PERSONNEL_ID]');
+  const nameField = form.fields.find((f) => f.system_tag === '[SYS_PERSONNEL_NAME]');
+  if (idField && nameField) {
+    const nip = (jawaban[idField.id] as string ?? '').trim();
+    const nama = (jawaban[nameField.id] as string ?? '').trim();
+    if (nip && nama) repo.catatDirektori(nip, nama, spjId);
+  }
+  // Blok berulang
+  if (form.blok_berulang) {
+    const blokIdField = form.blok_berulang.fields.find((f) => f.system_tag === '[SYS_PERSONNEL_ID]');
+    const blokNameField = form.blok_berulang.fields.find((f) => f.system_tag === '[SYS_PERSONNEL_NAME]');
+    if (blokIdField && blokNameField) {
+      const rows = jawaban[form.blok_berulang.id];
+      if (Array.isArray(rows)) {
+        for (const row of rows as Record<string, string>[]) {
+          const nip = (row[blokIdField.id] ?? '').trim();
+          const nama = (row[blokNameField.id] ?? '').trim();
+          if (nip && nama) repo.catatDirektori(nip, nama, spjId);
+        }
+      }
+    }
+  }
+}
